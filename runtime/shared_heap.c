@@ -402,6 +402,7 @@ static void* large_allocate(struct caml_heap_state* local, mlsize_t sz, mlsize_t
   local->stats.large_blocks++;
   a->owner = local->owner;
   a->next = local->swept_large;
+  /* shift a from real start to beggining of the structure and save real pointer into a */
   local->swept_large = a;
   return (char*)a + LARGE_ALLOC_HEADER_SZ;
 }
