@@ -15,6 +15,9 @@
 
 (* Typechecking for the core language *)
 
+[@@@ocaml.warning "-60"] module Str = Ast_helper.Str (* For ocamldep *)
+[@@@ocaml.warning "+60"]
+
 open Misc
 open Asttypes
 open Parsetree
@@ -22,6 +25,8 @@ open Types
 open Typedtree
 open Btype
 open Ctype
+
+module Style = Misc.Style
 
 type type_forcing_context =
   | If_conditional
@@ -370,10 +375,17 @@ let get_gadt_equations_level () =
     Some y -> y
   | None -> assert false
 
-let nothing_equated = TypePairs.create 0
+(* Unification inside type_pat *)
+let unify_pat_types loc env ty ty' =
+  try unify env ty ty' with
+  | Unify err ->
+      raise(Error(loc, env, Pattern_type_clash(err, None)))
+  | Tags(l1,l2) ->
+      raise(Typetexp.Error(loc, env, Typetexp.Variant_tags (l1, l2)))
 
-(* unification inside type_pat*)
-let unify_pat_types_return_equated_pairs ?(refine = None) loc env ty ty' =
+(* GADT unification inside solve_Ppat_construct and check_counter_example_pat *)
+let nothing_equated = TypePairs.create 0
+let unify_pat_types_return_equated_pairs ~refine loc env ty ty' =
   try
     match refine with
     | Some allow_recursive_equations ->
@@ -388,14 +400,13 @@ let unify_pat_types_return_equated_pairs ?(refine = None) loc env ty ty' =
   | Tags(l1,l2) ->
       raise(Typetexp.Error(loc, !env, Typetexp.Variant_tags (l1, l2)))
 
-let unify_pat_types ?refine loc env ty ty' =
-  ignore (unify_pat_types_return_equated_pairs ?refine loc env ty ty')
-
+let unify_pat_types_refine ~refine loc env ty ty' =
+  ignore (unify_pat_types_return_equated_pairs ~refine loc env ty ty')
 
 (** [sdesc_for_hint] is used by error messages to report literals in their
     original formatting *)
-let unify_pat ?refine ?sdesc_for_hint env pat expected_ty =
-  try unify_pat_types ?refine pat.pat_loc env pat.pat_type expected_ty
+let unify_pat ?sdesc_for_hint env pat expected_ty =
+  try unify_pat_types pat.pat_loc env pat.pat_type expected_ty
   with Error (loc, env, Pattern_type_clash(err, None)) ->
     raise(Error(loc, env, Pattern_type_clash(err, sdesc_for_hint)))
 
@@ -404,7 +415,7 @@ let unify_head_only ~refine loc env ty constr =
   let path = cstr_type_path constr in
   let decl = Env.find_type path !env in
   let ty' = Ctype.newconstr path (Ctype.instance_list decl.type_params) in
-  unify_pat_types ~refine loc env ty' ty
+  unify_pat_types_refine ~refine loc env ty' ty
 
 (* Creating new conjunctive types is not allowed when typing patterns *)
 (* make all Reither present in open variants *)
@@ -422,8 +433,7 @@ let finalize_variant pat tag opat r =
   | Reither (false, ty::tl, _) when not (row_closed row) ->
       link_row_field_ext ~inside:f (rf_present (Some ty));
       begin match opat with None -> assert false
-      | Some pat ->
-          let env = ref pat.pat_env in List.iter (unify_pat env pat) (ty::tl)
+      | Some pat -> List.iter (unify_pat pat.pat_env pat) (ty::tl)
       end
   | Reither (c, _l, true) when not (has_fixed_explanation row) ->
       link_row_field_ext ~inside:f (rf_either [] ~no_arg:c ~matched:false)
@@ -560,29 +570,33 @@ let enter_orpat_variables loc env  p1_vs p2_vs =
           raise (Error (loc, env, err)) in
   unify_vars p1_vs p2_vs
 
-let rec build_as_type ~refine (env : Env.t ref) p =
-  let as_ty = build_as_type_aux ~refine env p in
-  (* Cf. #1655 *)
-  List.fold_left (fun as_ty (extra, _loc, _attrs) ->
-    match extra with
-    | Tpat_type _ | Tpat_open _ | Tpat_unpack -> as_ty
-    | Tpat_constraint cty ->
+let rec build_as_type (env : Env.t) p =
+  build_as_type_extra env p p.pat_extra
+
+and build_as_type_extra env p = function
+  | [] -> build_as_type_aux env p
+  | ((Tpat_type _ | Tpat_open _ | Tpat_unpack), _, _) :: rest ->
+      build_as_type_extra env p rest
+  | (Tpat_constraint {ctyp_type = ty; _}, _, _) :: rest ->
+      (* If the type constraint is ground, then this is the best type
+         we can return, so just return an instance (cf. #12313) *)
+      if free_variables ty = [] then instance ty else
+      (* Otherwise we combine the inferred type for the pattern with
+         then non-ground constraint in a non-ambivalent way *)
+      let as_ty = build_as_type_extra env p rest in
       (* [generic_instance] can only be used if the variables of the original
          type ([cty.ctyp_type] here) are not at [generic_level], which they are
          here.
          If we used [generic_instance] we would lose the sharing between
          [instance ty] and [ty].  *)
       let ty =
-        with_local_level ~post:generalize_structure
-          (fun () -> instance cty.ctyp_type)
+        with_local_level ~post:generalize_structure (fun () -> instance ty)
       in
-      (* This call to unify can't fail since the pattern is well typed. *)
-      unify_pat_types ~refine p.pat_loc env (instance as_ty) (instance ty);
+      (* This call to unify may only fail due to missing GADT equations *)
+      unify_pat_types p.pat_loc env (instance as_ty) (instance ty);
       ty
-  ) as_ty p.pat_extra
 
-and build_as_type_aux ~refine (env : Env.t ref) p =
-  let build_as_type = build_as_type ~refine in
+and build_as_type_aux (env : Env.t) p =
   match p.pat_desc with
     Tpat_alias(p1,_, _) -> build_as_type env p1
   | Tpat_tuple pl ->
@@ -597,7 +611,7 @@ and build_as_type_aux ~refine (env : Env.t ref) p =
       let ty_args, ty_res, _ =
         instance_constructor Keep_existentials_flexible cstr
       in
-      List.iter2 (fun (p,ty) -> unify_pat ~refine env {p with pat_type = ty})
+      List.iter2 (fun (p,ty) -> unify_pat env {p with pat_type = ty})
         (List.combine pl tyl) ty_args;
       ty_res
   | Tpat_variant(l, p', _) ->
@@ -612,18 +626,17 @@ and build_as_type_aux ~refine (env : Env.t ref) p =
       let ppl = List.map (fun (_, l, p) -> l.lbl_pos, p) lpl in
       let do_label lbl =
         let _, ty_arg, ty_res = instance_label false lbl in
-        unify_pat ~refine env {p with pat_type = ty} ty_res;
+        unify_pat env {p with pat_type = ty} ty_res;
         let refinable =
           lbl.lbl_mut = Immutable && List.mem_assoc lbl.lbl_pos ppl &&
           match get_desc lbl.lbl_arg with Tpoly _ -> false | _ -> true in
         if refinable then begin
           let arg = List.assoc lbl.lbl_pos ppl in
-          unify_pat ~refine env
-            {arg with pat_type = build_as_type env arg} ty_arg
+          unify_pat env {arg with pat_type = build_as_type env arg} ty_arg
         end else begin
           let _, ty_arg', ty_res' = instance_label false lbl in
-          unify_pat_types ~refine p.pat_loc env ty_arg ty_arg';
-          unify_pat ~refine env p ty_res'
+          unify_pat_types p.pat_loc env ty_arg ty_arg';
+          unify_pat env p ty_res'
         end in
       Array.iter do_label lbl.lbl_all;
       ty
@@ -631,7 +644,7 @@ and build_as_type_aux ~refine (env : Env.t ref) p =
       begin match row with
         None ->
           let ty1 = build_as_type env p1 and ty2 = build_as_type env p2 in
-          unify_pat ~refine env {p2 with pat_type = ty2} ty1;
+          unify_pat env {p2 with pat_type = ty2} ty1;
           ty1
       | Some row ->
           let Row {fields; fixed; name} = row_repr row in
@@ -643,9 +656,9 @@ and build_as_type_aux ~refine (env : Env.t ref) p =
 
 (* Constraint solving during typing of patterns *)
 
-let solve_Ppat_poly_constraint ~refine env loc sty expected_ty =
-  let cty, ty, force = Typetexp.transl_simple_type_delayed !env sty in
-  unify_pat_types ~refine loc env ty (instance expected_ty);
+let solve_Ppat_poly_constraint env loc sty expected_ty =
+  let cty, ty, force = Typetexp.transl_simple_type_delayed env sty in
+  unify_pat_types loc env ty (instance expected_ty);
   pattern_force := force :: !pattern_force;
   match get_desc ty with
   | Tpoly (body, tyl) ->
@@ -656,18 +669,19 @@ let solve_Ppat_poly_constraint ~refine env loc sty expected_ty =
       (cty, ty, ty')
   | _ -> assert false
 
-let solve_Ppat_alias ~refine env pat =
-  with_local_level ~post:generalize (fun () -> build_as_type ~refine env pat)
+let solve_Ppat_alias env pat =
+  with_local_level ~post:generalize (fun () -> build_as_type env pat)
 
 let solve_Ppat_tuple (type a) ~refine loc env (args : a list) expected_ty =
   let vars = List.map (fun _ -> newgenvar ()) args in
   let ty = newgenty (Ttuple vars) in
   let expected_ty = generic_instance expected_ty in
-  unify_pat_types ~refine loc env ty expected_ty;
+  unify_pat_types_refine ~refine loc env ty expected_ty;
   vars
 
 let solve_constructor_annotation env name_list sty ty_args ty_ex =
   let expansion_scope = get_gadt_equations_level () in
+  (* XXX: should use fold and return the updated environment *)
   let ids =
     List.map
       (fun name ->
@@ -688,10 +702,10 @@ let solve_constructor_annotation env name_list sty ty_args ty_ex =
     match ty_args with
       [] -> assert false
     | [ty_arg] ->
-        unify_pat_types cty.ctyp_loc env ty1 ty_arg;
+        unify_pat_types cty.ctyp_loc !env ty1 ty_arg;
         [ty2]
     | _ ->
-        unify_pat_types cty.ctyp_loc env ty1 (newty (Ttuple ty_args));
+        unify_pat_types cty.ctyp_loc !env ty1 (newty (Ttuple ty_args));
         match get_desc (expand_head !env ty2) with
           Ttuple tyl -> tyl
         | _ -> assert false
@@ -796,7 +810,7 @@ let solve_Ppat_record_field ~refine loc env label label_lid record_ty =
   with_local_level_iter ~post:generalize_structure begin fun () ->
     let (_, ty_arg, ty_res) = instance_label false label in
     begin try
-      unify_pat_types ~refine loc env ty_res (instance record_ty)
+      unify_pat_types_refine ~refine loc env ty_res (instance record_ty)
     with Error(_loc, _env, Pattern_type_clash(err, _)) ->
       raise(Error(label_lid.loc, !env,
                   Label_mismatch(label_lid.txt, err)))
@@ -807,24 +821,24 @@ let solve_Ppat_record_field ~refine loc env label label_lid record_ty =
 let solve_Ppat_array ~refine loc env expected_ty =
   let ty_elt = newgenvar() in
   let expected_ty = generic_instance expected_ty in
-  unify_pat_types ~refine
+  unify_pat_types_refine ~refine
     loc env (Predef.type_array ty_elt) expected_ty;
   ty_elt
 
-let solve_Ppat_lazy  ~refine loc env expected_ty =
+let solve_Ppat_lazy ~refine loc env expected_ty =
   let nv = newgenvar () in
-  unify_pat_types ~refine loc env (Predef.type_lazy_t nv)
+  unify_pat_types_refine ~refine loc env (Predef.type_lazy_t nv)
     (generic_instance expected_ty);
   nv
 
-let solve_Ppat_constraint ~refine loc env sty expected_ty =
+let solve_Ppat_constraint loc env sty expected_ty =
   let cty, ty, force =
     with_local_level ~post:(fun (_, ty, _) -> generalize_structure ty)
-      (fun () -> Typetexp.transl_simple_type_delayed !env sty)
+      (fun () -> Typetexp.transl_simple_type_delayed env sty)
   in
   pattern_force := force :: !pattern_force;
   let ty, expected_ty' = instance ty, ty in
-  unify_pat_types ~refine loc env ty (instance expected_ty);
+  unify_pat_types loc env ty (instance expected_ty);
   (cty, ty, expected_ty')
 
 let solve_Ppat_variant ~refine loc env tag no_arg expected_ty =
@@ -838,7 +852,7 @@ let solve_Ppat_variant ~refine loc env tag no_arg expected_ty =
   (* PR#7404: allow some_private_tag blindly, as it would not unify with
      the abstract row variable *)
   if tag <> Parmatch.some_private_tag then
-    unify_pat_types ~refine loc env (newgenty(Tvariant row)) expected_ty;
+    unify_pat_types_refine ~refine loc env (newgenty(Tvariant row)) expected_ty;
   (arg_type, make_row (newvar ()), instance expected_ty)
 
 (* Building the or-pattern corresponding to a polymorphic variant type *)
@@ -1481,9 +1495,8 @@ and type_pat_aux
     type_pat category ~no_existentials ~env
   in
   let loc = sp.ppat_loc in
-  let refine = None in
   let solve_expected (x : pattern) : pattern =
-    unify_pat ~refine ~sdesc_for_hint:sp.ppat_desc env x (instance expected_ty);
+    unify_pat ~sdesc_for_hint:sp.ppat_desc !env x (instance expected_ty);
     x
   in
   let crp (x : k general_pattern) : k general_pattern =
@@ -1542,7 +1555,7 @@ and type_pat_aux
       ({ptyp_desc=Ptyp_poly _} as sty)) ->
       (* explicitly polymorphic type *)
       let cty, ty, ty' =
-        solve_Ppat_poly_constraint ~refine env lloc sty expected_ty in
+        solve_Ppat_poly_constraint !env lloc sty expected_ty in
       let id = enter_variable lloc name ty' attrs in
       rvp { pat_desc = Tpat_var (id, name);
             pat_loc = lloc;
@@ -1552,7 +1565,7 @@ and type_pat_aux
             pat_env = !env }
   | Ppat_alias(sq, name) ->
       let q = type_pat Value sq expected_ty in
-      let ty_var = solve_Ppat_alias ~refine env q in
+      let ty_var = solve_Ppat_alias !env q in
       let id =
         enter_variable ~is_as_variable:true loc name ty_var sp.ppat_attributes
       in
@@ -1587,7 +1600,8 @@ and type_pat_aux
       raise (Error (loc, !env, Invalid_interval))
   | Ppat_tuple spl ->
       assert (List.length spl >= 2);
-      let expected_tys = solve_Ppat_tuple ~refine loc env spl expected_ty in
+      let expected_tys =
+        solve_Ppat_tuple ~refine:None loc env spl expected_ty in
       let pl = List.map2 (type_pat Value) spl expected_tys in
       rvp {
         pat_desc = Tpat_tuple pl;
@@ -1659,7 +1673,7 @@ and type_pat_aux
                                      constr.cstr_arity, List.length sargs)));
 
       let (ty_args, existential_ctyp) =
-        solve_Ppat_construct ~refine env loc constr no_existentials
+        solve_Ppat_construct ~refine:None env loc constr no_existentials
           existential_styp expected_ty
       in
 
@@ -1690,7 +1704,7 @@ and type_pat_aux
       assert (tag <> Parmatch.some_private_tag);
       let constant = (sarg = None) in
       let arg_type, row, pat_type =
-        solve_Ppat_variant ~refine loc env tag constant expected_ty in
+        solve_Ppat_variant ~refine:None loc env tag constant expected_ty in
       let arg =
         (* PR#6235: propagate type information *)
         match sarg, arg_type with
@@ -1717,7 +1731,8 @@ and type_pat_aux
       in
       let type_label_pat (label_lid, label, sarg) =
         let ty_arg =
-          solve_Ppat_record_field ~refine loc env label label_lid record_ty in
+          solve_Ppat_record_field ~refine:None loc env label label_lid
+            record_ty in
         (label_lid, label, type_pat Value sarg ty_arg)
       in
       let make_record_pat lbl_pat_list =
@@ -1739,7 +1754,7 @@ and type_pat_aux
       in
       rvp @@ solve_expected (make_record_pat lbl_a_list)
   | Ppat_array spl ->
-      let ty_elt = solve_Ppat_array ~refine loc env expected_ty in
+      let ty_elt = solve_Ppat_array ~refine:None loc env expected_ty in
       let pl = List.map (fun p -> type_pat Value p ty_elt) spl in
       rvp {
         pat_desc = Tpat_array pl;
@@ -1790,7 +1805,7 @@ and type_pat_aux
            pat_attributes = sp.ppat_attributes;
            pat_env = !env }
   | Ppat_lazy sp1 ->
-      let nv = solve_Ppat_lazy ~refine loc env expected_ty in
+      let nv = solve_Ppat_lazy ~refine:None loc env expected_ty in
       let p1 = type_pat Value sp1 nv in
       rvp {
         pat_desc = Tpat_lazy p1;
@@ -1801,7 +1816,7 @@ and type_pat_aux
   | Ppat_constraint(sp, sty) ->
       (* Pretend separate = true *)
       let cty, ty, expected_ty' =
-        solve_Ppat_constraint ~refine loc env sty expected_ty in
+        solve_Ppat_constraint loc !env sty expected_ty in
       let p = type_pat category sp expected_ty' in
       let extra = (Tpat_constraint cty, loc, sp.ppat_attributes) in
       begin match category, (p : k general_pattern) with
@@ -1932,7 +1947,7 @@ let type_class_arg_pattern cl_num val_env met_env l spat =
     finalize_variants pat;
   end;
   List.iter (fun f -> f()) (get_ref pattern_force);
-  if is_optional l then unify_pat (ref val_env) pat (type_option (newvar ()));
+  if is_optional l then unify_pat val_env pat (type_option (newvar ()));
   let (pv, val_env, met_env) =
     List.fold_right
       (fun {pv_id; pv_type; pv_loc; pv_as_var; pv_attributes}
@@ -2141,7 +2156,8 @@ let rec check_counter_example_pat ~info ~env tp expected_ty k =
   let loc = tp.pat_loc in
   let refine = Some true in
   let solve_expected (x : pattern) : pattern =
-    unify_pat ~refine env x (instance expected_ty);
+    unify_pat_types_refine ~refine x.pat_loc env x.pat_type
+      (instance expected_ty);
     x
   in
   (* "make pattern" and "make pattern then continue" *)
@@ -2529,11 +2545,18 @@ let rec approx_type env sty =
       approx_type env sty
   | _ -> newvar ()
 
+let type_pattern_approx env spat =
+  match spat.ppat_desc with
+  | Ppat_constraint (_, sty) -> approx_type env sty
+  | _ -> newvar ()
+
 let rec type_approx env sexp =
   match sexp.pexp_desc with
     Pexp_let (_, _, e) -> type_approx env e
-  | Pexp_fun (p, _, _, e) ->
-      let ty = if is_optional p then type_option (newvar ()) else newvar () in
+  | Pexp_fun (p, _, spat, e) ->
+      let ty = type_pattern_approx env spat in
+      if is_optional p then
+        unify_pat_types spat.ppat_loc env ty (type_option (newvar ()));
       newty (Tarrow(p, ty, type_approx env e, commu_ok))
   | Pexp_function ({pc_rhs=e}::_) ->
       newty (Tarrow(Nolabel, newvar (), type_approx env e, commu_ok))
@@ -2841,8 +2864,8 @@ let check_absent_variant env =
         create_row ~fields
           ~more:(newvar ()) ~closed:false ~fixed:None ~name:None in
       (* Should fail *)
-      unify_pat (ref env) {pat with pat_type = newty (Tvariant row')}
-                          (correct_levels pat.pat_type)
+      unify_pat env {pat with pat_type = newty (Tvariant row')}
+                     (correct_levels pat.pat_type)
     | _ -> () }
 
 (* Getting proper location of already typed expressions.
@@ -2951,28 +2974,33 @@ let vb_exp_constraint {pvb_expr=expr; pvb_pat=pat; pvb_constraint=ct; _ } =
   let open Ast_helper in
   match ct with
   | None -> expr
-  | Some {locally_abstract_univars=[]; typ } ->
+  | Some (Pvc_constraint { locally_abstract_univars=[]; typ }) ->
       begin match typ.ptyp_desc with
       | Ptyp_poly _ -> expr
       | _ ->
           let loc = { expr.pexp_loc with Location.loc_ghost = true } in
           Exp.constraint_ ~loc expr typ
       end
-  | Some {locally_abstract_univars;typ} ->
+  | Some (Pvc_coercion { ground; coercion}) ->
+      let loc = { expr.pexp_loc with Location.loc_ghost = true } in
+      Exp.coerce ~loc expr ground coercion
+  | Some (Pvc_constraint { locally_abstract_univars=vars;typ}) ->
       let loc_start = pat.ppat_loc.Location.loc_start in
       let loc = { expr.pexp_loc with loc_start; loc_ghost=true } in
       let expr = Exp.constraint_ ~loc expr typ in
-      List.fold_right (Exp.newtype ~loc) locally_abstract_univars expr
+      List.fold_right (Exp.newtype ~loc) vars expr
 
 let vb_pat_constraint ({pvb_pat=pat; pvb_expr = exp; _ } as vb) =
   vb.pvb_attributes,
   let open Ast_helper in
   match vb.pvb_constraint, pat.ppat_desc, exp.pexp_desc with
-  | Some {locally_abstract_univars=[]; typ }, _, _ ->
+  | Some (Pvc_constraint {locally_abstract_univars=[]; typ}
+         | Pvc_coercion { coercion=typ; _ }),
+    _, _ ->
       Pat.constraint_ ~loc:{pat.ppat_loc with Location.loc_ghost=true} pat typ
-  | Some {locally_abstract_univars; typ }, _, _ ->
-      let varified = Typ.varify_constructors locally_abstract_univars typ in
-      let t = Typ.poly ~loc:typ.ptyp_loc locally_abstract_univars varified in
+  | Some (Pvc_constraint {locally_abstract_univars=vars; typ }), _, _ ->
+      let varified = Typ.varify_constructors vars typ in
+      let t = Typ.poly ~loc:typ.ptyp_loc vars varified in
       let loc_end = typ.ptyp_loc.Location.loc_end in
       let loc =  { pat.ppat_loc with loc_end; loc_ghost=true } in
       Pat.constraint_ ~loc pat t
@@ -3566,11 +3594,16 @@ and type_expect_
   | Pexp_while(scond, sbody) ->
       let cond = type_expect env scond
           (mk_expected ~explanation:While_loop_conditional Predef.type_bool) in
+      let exp_type =
+        match cond.exp_desc with
+        | Texp_construct(_, {cstr_name="true"}, _) -> instance ty_expected
+        | _ -> instance Predef.type_unit
+      in
       let body = type_statement ~explanation:While_loop_body env sbody in
       rue {
         exp_desc = Texp_while(cond, body);
         exp_loc = loc; exp_extra = [];
-        exp_type = instance Predef.type_unit;
+        exp_type;
         exp_attributes = sexp.pexp_attributes;
         exp_env = env }
   | Pexp_for(param, slow, shigh, dir, sbody) ->
@@ -4988,10 +5021,26 @@ and type_construct env loc lid sarg ty_expected_explained attrs =
 (* Typing of statements (expressions whose values are discarded) *)
 
 and type_statement ?explanation env sexp =
+  (* OCaml 5.2.0 changed the type of 'while' to give 'while true do e done'
+     a polymorphic type.  The change has the potential to trigger a
+     nonreturning-statement warning in existing code that follows
+     'while true' with some other statement, e.g.
+
+         while true do e done; assert false
+
+    To avoid this issue, we disable the warning in this particular case.
+    We might consider re-enabling it at a point when most users have
+    migrated to OCaml 5.2.0 or later. *)
+  let allow_polymorphic e = match e.pexp_desc with
+    | Pexp_while _ -> true
+    | _ -> false
+  in
   (* Raise the current level to detect non-returning functions *)
   let exp = with_local_level (fun () -> type_exp env sexp) in
   let ty = expand_head env exp.exp_type in
-  if is_Tvar ty && get_level ty > get_current_level () then
+  if is_Tvar ty
+     && get_level ty > get_current_level ()
+     && not (allow_polymorphic sexp) then
     Location.prerr_warning
       (final_subexpression exp).exp_loc
       Warnings.Nonreturning_statement;
@@ -5106,7 +5155,7 @@ and type_cases
       let ty_arg' = newvar () in
       let unify_pats ty =
         List.iter (fun { typed_pat = pat; pat_type_for_unif = pat_ty; _ } ->
-          unify_pat_types pat.pat_loc (ref env) pat_ty ty
+          unify_pat_types pat.pat_loc env pat_ty ty
         ) half_typed_cases
       in
       unify_pats ty_arg';
@@ -5247,7 +5296,9 @@ and type_let ?check ?check_strict
                       {pat with pat_type =
                        snd (instance_poly ~keep_names:true false tl ty)}
                   | _ -> pat
-                in unify_pat (ref env) pat (type_approx env binding.pvb_expr))
+                in
+                let bound_expr = vb_exp_constraint binding in
+                unify_pat env pat (type_approx env bound_expr))
               pat_list spat_sexp_list;
           (* Polymorphic variant processing *)
           List.iter
@@ -5708,9 +5759,13 @@ let report_literal_type_constraint expected_type const =
       Some '.'
     else None
   in
+  let pp_const ppf (c,s) = Format.fprintf ppf "%s%c" c s in
   match const_str, suffix with
-  | Some c, Some s -> [ Location.msg "@[@{<hint>Hint@}: Did you \
-                                      mean `%s%c'?@]" c s ]
+  | Some c, Some s -> [
+      Location.msg
+        "@[@{<hint>Hint@}: Did you mean %a?@]"
+        (Style.as_inline_code pp_const) (c,s)
+    ]
   | _, _ -> []
 
 let report_literal_type_constraint const = function
@@ -5783,7 +5838,8 @@ let report_unification_error ~loc ?sub env err
 let report_this_function ppf funct =
   if Typedtree.exp_is_nominal funct then
     let pexp = Untypeast.untype_expression funct in
-    Format.fprintf ppf "The function '%a'" Pprintast.expression pexp
+    Format.fprintf ppf "The function %a"
+      (Style.as_inline_code Pprintast.expression) pexp
   else Format.fprintf ppf "This function"
 
 let report_too_many_arg_error ~funct ~func_ty ~previous_arg_loc
@@ -5821,12 +5877,12 @@ let report_error ~loc env = function
       Location.errorf ~loc
        "@[The constructor %a@ expects %i argument(s),@ \
         but is applied here to %i argument(s)@]"
-       longident lid expected provided
+       (Style.as_inline_code longident) lid expected provided
   | Label_mismatch(lid, err) ->
       report_unification_error ~loc env err
         (function ppf ->
            fprintf ppf "The record field %a@ belongs to the type"
-                   longident lid)
+                   (Style.as_inline_code longident) lid)
         (function ppf ->
            fprintf ppf "but is mixed here with fields of type")
   | Pattern_type_clash (err, pat) ->
@@ -5841,19 +5897,21 @@ let report_error ~loc env = function
   | Or_pattern_type_clash (id, err) ->
       report_unification_error ~loc env err
         (function ppf ->
-          fprintf ppf "The variable %s on the left-hand side of this \
-                       or-pattern has type" (Ident.name id))
+          fprintf ppf "The variable %a on the left-hand side of this \
+                       or-pattern has type" Style.inline_code (Ident.name id))
         (function ppf ->
           fprintf ppf "but on the right-hand side it has type")
   | Multiply_bound_variable name ->
       Location.errorf ~loc
-        "Variable %s is bound several times in this matching"
-        name
+        "Variable %a is bound several times in this matching"
+        Style.inline_code name
   | Orpat_vars (id, valid_idents) ->
       Location.error_of_printer ~loc (fun ppf () ->
         fprintf ppf
-          "Variable %s must occur on both sides of this | pattern"
-          (Ident.name id);
+          "Variable %a must occur on both sides of this %a pattern"
+          Style.inline_code (Ident.name id)
+          Style.inline_code "|"
+        ;
         spellcheck_idents ppf id valid_idents
       ) ()
   | Expr_type_clash (err, explanation, exp) ->
@@ -5879,13 +5937,15 @@ let report_error ~loc env = function
             ~extra_arg_loc ~returns_unit loc
       | _ ->
           Location.errorf ~loc "@[<v>@[<2>This expression has type@ %a@]@ %s@]"
-            Printtyp.type_expr func_ty
+            (Style.as_inline_code Printtyp.type_expr) func_ty
             "This is not a function; it cannot be applied."
       end
   | Apply_wrong_label (l, ty, extra_info) ->
       let print_label ppf = function
         | Nolabel -> fprintf ppf "without label"
-        | l -> fprintf ppf "with label %s" (prefixed_label_name l)
+        | l ->
+            fprintf ppf "with label %a"
+              Style.inline_code (prefixed_label_name l)
       in
       let extra_info =
         if not extra_info then
@@ -5903,30 +5963,32 @@ let report_error ~loc env = function
       Location.errorf ~loc "The record field label %s is defined several times"
         s
   | Label_missing labels ->
-      let print_labels ppf =
-        List.iter (fun lbl -> fprintf ppf "@ %s" (Ident.name lbl)) in
+      let print_label ppf lbl = Style.inline_code ppf (Ident.name lbl) in
+      let print_labels ppf = List.iter (fprintf ppf "@ %a" print_label) in
       Location.errorf ~loc "@[<hov>Some record fields are undefined:%a@]"
         print_labels labels
   | Label_not_mutable lid ->
-      Location.errorf ~loc "The record field %a is not mutable" longident lid
+      Location.errorf ~loc "The record field %a is not mutable"
+        (Style.as_inline_code longident) lid
   | Wrong_name (eorp, ty_expected, { type_path; kind; name; valid_names; }) ->
       Location.error_of_printer ~loc (fun ppf () ->
         Printtyp.wrap_printing_env ~error:true env (fun () ->
           let { ty; explanation } = ty_expected in
           if Path.is_constructor_typath type_path then begin
             fprintf ppf
-              "@[The field %s is not part of the record \
+              "@[The field %a is not part of the record \
                argument for the %a constructor@]"
-              name.txt
-              Printtyp.type_path type_path;
+              Style.inline_code name.txt
+              (Style.as_inline_code Printtyp.type_path) type_path;
           end else begin
             fprintf ppf
               "@[@[<2>%s type@ %a%t@]@ \
-               There is no %s %s within type %a@]"
-              eorp Printtyp.type_expr ty
+               There is no %s %a within type %a@]"
+              eorp (Style.as_inline_code Printtyp.type_expr) ty
               (report_type_expected_explanation_opt explanation)
               (Datatype_kind.label_name kind)
-              name.txt (*kind*) Printtyp.type_path type_path;
+              Style.inline_code name.txt
+              (Style.as_inline_code Printtyp.type_path) type_path;
           end;
           spellcheck ppf name.txt valid_names
       )) ()
@@ -5937,10 +5999,11 @@ let report_error ~loc env = function
         Printtyp.report_ambiguous_type_error ppf env tp tpl
           (function ppf ->
              fprintf ppf "The %s %a@ belongs to the %s type"
-               name longident lid type_name)
+               name (Style.as_inline_code longident) lid
+              type_name)
           (function ppf ->
              fprintf ppf "The %s %a@ belongs to one of the following %s types:"
-               name longident lid type_name)
+               name (Style.as_inline_code longident) lid type_name)
           (function ppf ->
              fprintf ppf "but a %s was expected belonging to the %s type"
                name type_name)
@@ -5951,7 +6014,7 @@ let report_error ~loc env = function
     Location.error_of_printer ~loc (fun ppf () ->
       fprintf ppf "This expression is not an object;@ \
                    it has type %a"
-        Printtyp.type_expr ty;
+        (Style.as_inline_code Printtyp.type_expr) ty;
       report_type_expected_explanation_opt explanation ppf
     ) ()
   | Undefined_method (ty, me, valid_methods) ->
@@ -5959,7 +6022,9 @@ let report_error ~loc env = function
         Printtyp.wrap_printing_env ~error:true env (fun () ->
           fprintf ppf
             "@[<v>@[This expression has type@;<1 2>%a@]@,\
-             It has no method %s@]" Printtyp.type_expr ty me;
+             It has no method %a@]"
+            (Style.as_inline_code Printtyp.type_expr) ty
+            Style.inline_code me;
           begin match valid_methods with
             | None -> ()
             | Some valid_methods -> spellcheck ppf me valid_methods
@@ -5967,19 +6032,20 @@ let report_error ~loc env = function
       )) ()
   | Undefined_self_method (me, valid_methods) ->
       Location.error_of_printer ~loc (fun ppf () ->
-        fprintf ppf "This expression has no method %s" me;
+        fprintf ppf "This expression has no method %a" Style.inline_code me;
         spellcheck ppf me valid_methods;
       ) ()
   | Virtual_class cl ->
       Location.errorf ~loc "Cannot instantiate the virtual class %a"
-        longident cl
+        (Style.as_inline_code longident) cl
   | Unbound_instance_variable (var, valid_vars) ->
       Location.error_of_printer ~loc (fun ppf () ->
-        fprintf ppf "Unbound instance variable %s" var;
+        fprintf ppf "Unbound instance variable %a" Style.inline_code var;
         spellcheck ppf var valid_vars;
       ) ()
   | Instance_variable_not_mutable v ->
-      Location.errorf ~loc "The instance variable %s is not mutable" v
+      Location.errorf ~loc "The instance variable %a is not mutable"
+        Style.inline_code v
   | Not_subtype err ->
       Location.error_of_printer ~loc (fun ppf () ->
         Printtyp.Subtype.report_error ppf env err "is not a subtype of"
@@ -5989,8 +6055,8 @@ let report_error ~loc env = function
         "This object duplication occurs outside a method definition"
   | Value_multiply_overridden v ->
       Location.errorf ~loc
-        "The instance variable %s is overridden several times"
-        v
+        "The instance variable %a is overridden several times"
+        Style.inline_code v
   | Coercion_failure (ty_exp, err, b) ->
       Location.error_of_printer ~loc (fun ppf () ->
         Printtyp.report_unification_error ppf env err
@@ -5998,31 +6064,36 @@ let report_error ~loc env = function
              let ty_exp = Printtyp.prepare_expansion ty_exp in
              fprintf ppf "This expression cannot be coerced to type@;<1 2>%a;@ \
                           it has type"
-             (Printtyp.type_expansion Type) ty_exp)
+             (Style.as_inline_code @@ Printtyp.type_expansion Type) ty_exp)
           (function ppf ->
              fprintf ppf "but is here used with type");
         if b then
-          fprintf ppf ".@.@[<hov>%s@ @{<hint>Hint@}: Consider using a fully \
-                      explicit coercion@ %s@]"
-            "This simple coercion was not fully general."
-            "of the form: `(foo : ty1 :> ty2)'."
+          fprintf ppf
+            ".@.@[<hov>This simple coercion was not fully general.@ \
+             @{<hint>Hint@}: Consider using a fully explicit coercion@ \
+             of the form: %a@]"
+            Style.inline_code "(foo : ty1 :> ty2)"
       ) ()
   | Not_a_function (ty, explanation) ->
       Location.errorf ~loc
         "This expression should not be a function,@ \
          the expected type is@ %a%t"
-        Printtyp.type_expr ty
+        (Style.as_inline_code Printtyp.type_expr) ty
         (report_type_expected_explanation_opt explanation)
   | Too_many_arguments (ty, explanation) ->
       Location.errorf ~loc
         "This function expects too many arguments,@ \
          it should have type@ %a%t"
-        Printtyp.type_expr ty
+        (Style.as_inline_code Printtyp.type_expr) ty
         (report_type_expected_explanation_opt explanation)
   | Abstract_wrong_label {got; expected; expected_type; explanation} ->
-      let label ~long = function
-        | Nolabel -> "unlabeled"
-        | l       -> (if long then "labeled " else "") ^ prefixed_label_name l
+      let label ~long ppf = function
+        | Nolabel -> fprintf ppf "unlabeled"
+        | l       ->
+            if long then
+              fprintf ppf "labeled %a" Style.inline_code (prefixed_label_name l)
+            else
+              Style.inline_code ppf (prefixed_label_name l)
       in
       let second_long = match got, expected with
         | Nolabel, _ | _, Nolabel -> true
@@ -6030,29 +6101,34 @@ let report_error ~loc env = function
       in
       Location.errorf ~loc
         "@[<v>@[<2>This function should have type@ %a%t@]@,\
-         @[but its first argument is %s@ instead of %s%s@]@]"
-        Printtyp.type_expr expected_type
+         @[but its first argument is %a@ instead of %s%a@]@]"
+        (Style.as_inline_code Printtyp.type_expr) expected_type
         (report_type_expected_explanation_opt explanation)
-        (label ~long:true got)
+        (label ~long:true) got
         (if second_long then "being " else "")
-        (label ~long:second_long expected)
+        (label ~long:second_long) expected
   | Scoping_let_module(id, ty) ->
       Location.errorf ~loc
-        "This `let module' expression has type@ %a@ \
-         In this type, the locally bound module name %s escapes its scope"
-        Printtyp.type_expr ty id
+        "This %a expression has type@ %a@ \
+         In this type, the locally bound module name %a escapes its scope"
+        Style.inline_code "let module"
+        (Style.as_inline_code Printtyp.type_expr) ty
+        Style.inline_code id
   | Private_type ty ->
       Location.errorf ~loc "Cannot create values of the private type %a"
-        Printtyp.type_expr ty
+        (Style.as_inline_code Printtyp.type_expr) ty
   | Private_label (lid, ty) ->
       Location.errorf ~loc "Cannot assign field %a of the private type %a"
-        longident lid Printtyp.type_expr ty
+        (Style.as_inline_code longident) lid
+        (Style.as_inline_code Printtyp.type_expr) ty
   | Private_constructor (constr, ty) ->
       Location.errorf ~loc
-        "Cannot use private constructor %s to create values of type %a"
-        constr.cstr_name Printtyp.type_expr ty
+        "Cannot use private constructor %a to create values of type %a"
+        Style.inline_code constr.cstr_name
+        (Style.as_inline_code Printtyp.type_expr) ty
   | Not_a_polymorphic_variant_type lid ->
-      Location.errorf ~loc "The type %a@ is not a variant type" longident lid
+      Location.errorf ~loc "The type %a@ is not a variant type"
+        (Style.as_inline_code longident) lid
   | Incoherent_label_order ->
       Location.errorf ~loc
         "This function is applied to arguments@ \
@@ -6070,45 +6146,49 @@ let report_error ~loc env = function
   | Not_a_packed_module ty ->
       Location.errorf ~loc
         "This expression is packed module, but the expected type is@ %a"
-        Printtyp.type_expr ty
+        (Style.as_inline_code Printtyp.type_expr) ty
   | Unexpected_existential (reason, name, types) ->
       let reason_str =
-        match reason with
+         match reason with
         | In_class_args ->
-            "Existential types are not allowed in class arguments"
+            dprintf "Existential types are not allowed in class arguments"
         | In_class_def ->
-            "Existential types are not allowed in bindings inside \
+            dprintf "Existential types are not allowed in bindings inside \
              class definition"
         | In_self_pattern ->
-            "Existential types are not allowed in self patterns"
+            dprintf "Existential types are not allowed in self patterns"
         | At_toplevel ->
-            "Existential types are not allowed in toplevel bindings"
+            dprintf "Existential types are not allowed in toplevel bindings"
         | In_group ->
-            "Existential types are not allowed in \"let ... and ...\" bindings"
+            dprintf "Existential types are not allowed in %a bindings"
+              Style.inline_code "let ... and ..."
         | In_rec ->
-            "Existential types are not allowed in recursive bindings"
+            dprintf "Existential types are not allowed in recursive bindings"
         | With_attributes ->
-            "Existential types are not allowed in presence of attributes"
+            dprintf
+              "Existential types are not allowed in presence of attributes"
       in
       begin match List.find (fun ty -> ty <> "$" ^ name) types with
       | example ->
           Location.errorf ~loc
-            "%s,@ but this pattern introduces the existential type %s."
-            reason_str example
+            "%t,@ but this pattern introduces the existential type %a."
+            reason_str Style.inline_code example
       | exception Not_found ->
           Location.errorf ~loc
-            "%s,@ but the constructor %s introduces existential types."
-            reason_str name
+            "%t,@ but the constructor %a introduces existential types."
+            reason_str Style.inline_code name
       end
   | Invalid_interval ->
       Location.errorf ~loc
         "@[Only character intervals are supported in patterns.@]"
   | Invalid_for_loop_index ->
       Location.errorf ~loc
-        "@[Invalid for-loop index: only variables and _ are allowed.@]"
+        "@[Invalid for-loop index: only variables and %a are allowed.@]"
+        Style.inline_code "_"
   | No_value_clauses ->
       Location.errorf ~loc
-        "None of the patterns in this 'match' expression match values."
+        "None of the patterns in this %a expression match values."
+        Style.inline_code "match"
   | Exception_pattern_disallowed ->
       Location.errorf ~loc
         "@[Exception patterns are not allowed in this position.@]"
@@ -6125,41 +6205,47 @@ let report_error ~loc env = function
         "@[This constructor expects an inlined record argument.@]"
   | Unrefuted_pattern pat ->
       Location.errorf ~loc
-        "@[%s@ %s@ %a@]"
+        "@[%s@ %s@ @[%a@]@]"
         "This match case could not be refuted."
         "Here is an example of a value that would reach it:"
-        Printpat.top_pretty pat
+        (Style.as_inline_code Printpat.pretty_val) pat
   | Invalid_extension_constructor_payload ->
       Location.errorf ~loc
-        "Invalid [%%extension_constructor] payload, a constructor is expected."
+        "Invalid %a payload, a constructor is expected."
+        Style.inline_code "[%extension_constructor]"
   | Not_an_extension_constructor ->
       Location.errorf ~loc
         "This constructor is not an extension constructor."
   | Literal_overflow ty ->
       Location.errorf ~loc
-        "Integer literal exceeds the range of representable integers of type %s"
-        ty
+        "Integer literal exceeds the range of representable integers of type %a"
+        Style.inline_code ty
   | Unknown_literal (n, m) ->
-      Location.errorf ~loc "Unknown modifier '%c' for literal %s%c" m n m
+      let pp_lit ppf (n,m) = fprintf ppf "%s%c" n m in
+      Location.errorf ~loc "Unknown modifier %a for literal %a"
+        (Style.as_inline_code pp_print_char) m
+        (Style.as_inline_code pp_lit) (n,m)
   | Illegal_letrec_pat ->
       Location.errorf ~loc
-        "Only variables are allowed as left-hand side of `let rec'"
+        "Only variables are allowed as left-hand side of %a"
+        Style.inline_code "let rec"
   | Illegal_letrec_expr ->
       Location.errorf ~loc
-        "This kind of expression is not allowed as right-hand side of `let rec'"
+        "This kind of expression is not allowed as right-hand side of %a"
+        Style.inline_code "let rec"
   | Illegal_class_expr ->
       Location.errorf ~loc
         "This kind of recursive class expression is not allowed"
   | Letop_type_clash(name, err) ->
       report_unification_error ~loc env err
         (function ppf ->
-          fprintf ppf "The operator %s has type" name)
+          fprintf ppf "The operator %a has type" Style.inline_code name)
         (function ppf ->
           fprintf ppf "but it was expected to have type")
   | Andop_type_clash(name, err) ->
       report_unification_error ~loc env err
         (function ppf ->
-          fprintf ppf "The operator %s has type" name)
+          fprintf ppf "The operator %a has type" Style.inline_code name)
         (function ppf ->
           fprintf ppf "but it was expected to have type")
   | Bindings_type_clash(err) ->
@@ -6169,11 +6255,16 @@ let report_error ~loc env = function
         (function ppf ->
           fprintf ppf "but bindings were expected of type")
   | Unbound_existential (ids, ty) ->
+      let pp_ident ppf id = pp_print_string ppf (Ident.name id) in
+      let pp_type ppf (ids,ty)=
+        fprintf ppf "@[type %a.@ %a@]@]"
+          (pp_print_list ~pp_sep:pp_print_space pp_ident) ids
+          Printtyp.type_expr ty
+      in
       Location.errorf ~loc
-        "@[<2>%s:@ @[type %s.@ %a@]@]"
+        "@[<2>%s:@ %a@]"
         "This type does not bind all existentials in the constructor"
-        (String.concat " " (List.map Ident.name ids))
-        Printtyp.type_expr ty
+        (Style.as_inline_code pp_type) (ids, ty)
   | Missing_type_constraint ->
       Location.errorf ~loc
         "@[%s@ %s@]"
@@ -6196,13 +6287,13 @@ let report_error ~loc env = function
       Location.errorf ~loc
         "This %s should not be a %s,@ \
          the expected type is@ %a%t"
-        ctx sort Printtyp.type_expr ty
+        ctx sort (Style.as_inline_code Printtyp.type_expr) ty
         (report_type_expected_explanation_opt explanation)
   | Expr_not_a_record_type ty ->
       Location.errorf ~loc
         "This expression has type %a@ \
          which is not a record type."
-        Printtyp.type_expr ty
+        (Style.as_inline_code Printtyp.type_expr) ty
 
 let report_error ~loc env err =
   Printtyp.wrap_printing_env ~error:true env
